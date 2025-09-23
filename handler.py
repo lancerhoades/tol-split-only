@@ -10,6 +10,7 @@ PHRASES = {
         "He's been anticipating your presence",
         "anticipating your presence here for a long time",
         "Welcome to Tree of Life",
+	"anticipating your presence",
         "I'm so excited for today"
     ],
     "worship_end": [
