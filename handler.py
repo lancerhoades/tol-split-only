@@ -202,6 +202,39 @@ def parse_timestamped_lines(text: str) -> List[Tuple[float, float, str]]:
 
     return parsed
 
+# --- VTT writer from FW JSON segments ---
+def _fmt_ts(t: float) -> str:
+    if t < 0: t = 0.0
+    h = int(t // 3600); m = int((t % 3600) // 60); s = t - (h*3600 + m*60)
+    return f"{h:02d}:{m:02d}:{s:06.3f}".replace(".", ",")
+
+def write_vtt_from_segments(segments, out_path, window_start: float, window_end: float, shift_to_zero: bool=True):
+    """Clip FW segments to [window_start, window_end] and write WebVTT.
+    The cues are shifted so window_start -> 00:00.
+    """
+    cues = []
+    for s in segments or []:
+        try:
+            st = float(s.get("start")); en = float(s.get("end")); tx = (s.get("text") or "").strip()
+        except Exception:
+            continue
+        if en <= window_start or st >= window_end:
+            continue
+        st = max(st, window_start); en = min(en, window_end)
+        if shift_to_zero:
+            st -= window_start; en -= window_start
+        if en - st <= 0.05:
+            continue
+        cues.append((st, en, tx))
+    if not cues:
+        return False
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("WEBVTT\n\n")
+        for idx, (st, en, tx) in enumerate(cues, 1):
+            f.write(f"{idx}\n{_fmt_ts(st)} --> {_fmt_ts(en)}\n{tx}\n\n")
+    return True
+
+
 # -------------------------------------------------------------------
 # JSON transcript (Whisper/Faster-Whisper) parsing
 # -------------------------------------------------------------------
@@ -517,9 +550,43 @@ def handler(event):
             urls["announcements_url"] = up(ann_p, put_ann, get_ann, "ann")
             urls["sermon_url"] = up(sermon_p, put_sermon, get_sermon, "sermon")
 
+            # --- Per-split VTTs from transcript JSON (skip pre-worship) ---
+            segments_json = None
+            try:
+                with open(transcript_path, "r", encoding="utf-8", errors="ignore") as _tf:
+                    _maybe = json.load(_tf)
+                    if isinstance(_maybe, dict) and isinstance(_maybe.get("segments"), list):
+                        segments_json = _maybe["segments"]
+            except Exception:
+                segments_json = None
+
+            vtt_urls = {}
+            def _mk_vtt_and_upload(path_mp4, key_name, start_s, end_s):
+                if not segments_json or not inp.get("s3"):
+                    return None
+                vtt_path = os.path.splitext(path_mp4)[0] + ".vtt"
+                ok_vtt = write_vtt_from_segments(segments_json, vtt_path, start_s, end_s, shift_to_zero=True)
+                if not ok_vtt:
+                    return None
+                s3 = inp["s3"]
+                mp4_key = s3.get("keys", {}).get(key_name)
+                if not mp4_key:
+                    return None
+                vtt_key = os.path.splitext(mp4_key)[0] + ".vtt"
+                upload_s3(s3["bucket"], vtt_key, vtt_path, s3.get("region"))
+                print(f"[UPLOAD] S3 -> {key_name} VTT: s3://{s3['bucket']}/{vtt_key}")
+                return f"s3://{s3['bucket']}/{vtt_key}"
+
+            # Only create VTTs for main three splits
+            vtt_urls["worship_vtt"] = _mk_vtt_and_upload(worship_p, "worship", worship_start, worship_end)
+            vtt_urls["announcements_vtt"] = _mk_vtt_and_upload(ann_p, "ann", worship_end, announcements_end)
+            vtt_urls["sermon_vtt"] = _mk_vtt_and_upload(sermon_p, "sermon", announcements_end, dur)
+
+
             return {
                 "ok": True,
                 "urls": urls,
+                "vtts": vtt_urls,
                 "bounds": {
                     "duration": dur,
                     "worship_start": worship_start,
