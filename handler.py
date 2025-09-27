@@ -108,15 +108,14 @@ def normalize_text(s: str) -> str:
 def partial_match(norm_phrase: str, norm_text: str, num_words: int = 5) -> bool:
     """
     Simple containment check using the first N words of the phrase.
-    Default lowered to 5 for more tolerant matching.
+    Try 5→4→3-word prefixes for tolerance.
     """
     pw = norm_phrase.split()
     if not pw:
         return False
-    # try 5,4,3-word prefixes for tolerance
     for n in (num_words, 4, 3):
         n = min(n, len(pw))
-        if n <= 0: 
+        if n <= 0:
             continue
         snippet = " ".join(pw[:n])
         if snippet in norm_text:
@@ -202,6 +201,44 @@ def parse_timestamped_lines(text: str) -> List[Tuple[float, float, str]]:
         i += 1
 
     return parsed
+
+# -------------------------------------------------------------------
+# JSON transcript (Whisper/Faster-Whisper) parsing
+# -------------------------------------------------------------------
+def parse_whisper_json_str(s: str) -> List[Tuple[float, float, str]]:
+    """
+    Accept a Whisper/Faster-Whisper style JSON string with a top-level dict
+    containing 'segments': [{start, end, text, ...}, ...] or a list.
+    Returns [(start, end, text), ...]
+    """
+    try:
+        obj = json.loads(s)
+    except Exception:
+        return []
+
+    segs = []
+    if isinstance(obj, dict):
+        if isinstance(obj.get("segments"), list):
+            segs = obj["segments"]
+        else:
+            for v in obj.values():
+                if isinstance(v, list):
+                    segs = v
+                    break
+    elif isinstance(obj, list):
+        segs = obj
+
+    out: List[Tuple[float, float, str]] = []
+    for seg in segs:
+        try:
+            st = float(seg.get("start"))
+            en = float(seg.get("end"))
+            tx = (seg.get("text") or "").strip()
+            if tx and en > st >= 0:
+                out.append((st, en, tx))
+        except Exception:
+            continue
+    return out
 
 # -------------------------------------------------------------------
 # Phrase locator
@@ -335,7 +372,13 @@ def handler(event):
         with tempfile.TemporaryDirectory() as td:
             # download inputs
             video_path = os.path.join(td, "raw.mp4")
-            transcript_path = os.path.join(td, "transcript.txt")
+
+            # choose transcript filename extension by URL & parse JSON if needed
+            t_ext = os.path.splitext(urlparse(transcript_url).path)[1].lower() or ".txt"
+            if t_ext not in {".json", ".txt", ".vtt", ".srt"}:
+                t_ext = ".txt"
+            transcript_path = os.path.join(td, f"transcript{t_ext}")
+
             print(f"[INPUT] job_id={job_id}")
             print(f"[INPUT] transcript_url={transcript_url}")
             print(f"[INPUT] raw_video_url={raw_video_url}")
@@ -350,15 +393,25 @@ def handler(event):
             if debug_mode:
                 debug_file_head(transcript_path, max_lines=int(inp.get("debug_head_lines") or 12))
 
-            # parse transcript
+            # parse transcript (JSON first, else VTT/SRT/TXT)
             with open(transcript_path, "r", encoding="utf-8", errors="ignore") as f:
                 raw_tx = f.read()
-            parsed = parse_timestamped_lines(raw_tx)
+
+            parsed: List[Tuple[float, float, str]] = []
+            if t_ext == ".json" or raw_tx.lstrip().startswith("{"):
+                parsed = parse_whisper_json_str(raw_tx)
+                if debug_mode:
+                    print(f"[DEBUG] Detected JSON transcript; segments={len(parsed)}")
+            if not parsed:
+                parsed = parse_timestamped_lines(raw_tx)
+                if debug_mode:
+                    print(f"[DEBUG] Text/VTT/SRT parse; segments={len(parsed)}")
+
             if debug_mode:
                 debug_parsed_sample(parsed, max_rows=int(inp.get("debug_parsed_rows") or 6))
 
             if not parsed:
-                log_and_slack(":warning: Transcript parsed as empty; check format/regex.", slack_webhook)
+                log_and_slack(":warning: Transcript parsed as empty; check format/regex or JSON shape.", slack_webhook)
 
             # duration
             dur = ffprobe_duration(video_path)
@@ -437,12 +490,16 @@ def handler(event):
                 if not (os.path.exists(file_path) and os.path.getsize(file_path) > 0):
                     return None
                 if put_url:
+                    log_and_slack(f"[UPLOAD] PUT -> {s3key_name}", slack_webhook)
                     upload_put(put_url, file_path)
                     return get_url
                 elif inp.get("s3") and inp["s3"].get("bucket") and inp["s3"].get("keys", {}).get(s3key_name):
-                    s3 = inp["s3"]
-                    return upload_s3(s3["bucket"], s3["keys"][s3key_name], file_path, s3.get("region"))
+                    s3_inp = inp["s3"]
+                    uri = upload_s3(s3_inp["bucket"], s3_inp["keys"][s3key_name], file_path, s3_inp.get("region"))
+                    log_and_slack(f"[UPLOAD] S3 -> {s3key_name}: {uri}", slack_webhook)
+                    return uri
                 else:
+                    log_and_slack(f"[UPLOAD] No target for {s3key_name}; skipping.", slack_webhook)
                     return None
 
             put_pre = inp.get("pre_worship_put_url")
@@ -469,7 +526,7 @@ def handler(event):
                     "worship_end": worship_end,
                     "announcements_end": announcements_end
                 },
-                "notes": "ffmpeg -c copy trims based on transcript phrase matches (block-aware VTT/SRT parser, safe trims, debug feed)"
+                "notes": "ffmpeg -c copy trims based on transcript phrase matches (JSON/VTT/SRT parser, safe trims, debug feed)"
             }
 
     except requests.RequestException as e:
