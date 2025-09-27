@@ -27,8 +27,6 @@ PHRASES = {
         "walk on up and give a good friendly hello",
         "give a good, friendly hello"
     ],
-    # not used for boundaries directly (worship_end acts as announcements start),
-    # but kept here for reference / future use.
     "announcements_start": [
         "All right, everyone, please have a seat now so we can listen to our important announcements",
         "So why don't you go ahead and take a moment"
@@ -98,7 +96,6 @@ def truncate(s: str, n: int = 80) -> str:
 # -------------------------------------------------------------------
 def normalize_text(s: str) -> str:
     import string
-    # handle a few common non-ascii punctuation marks and separators
     s = s.replace("—", "-").replace("–", "-").replace("’", "'").replace("“", '"').replace("”", '"').replace("|", " ")
     s = s.lower().strip()
     s = s.translate(str.maketrans('', '', string.punctuation))
@@ -106,10 +103,6 @@ def normalize_text(s: str) -> str:
     return s
 
 def partial_match(norm_phrase: str, norm_text: str, num_words: int = 5) -> bool:
-    """
-    Simple containment check using the first N words of the phrase.
-    Try 5→4→3-word prefixes for tolerance.
-    """
     pw = norm_phrase.split()
     if not pw:
         return False
@@ -127,27 +120,15 @@ def partial_match(norm_phrase: str, norm_text: str, num_words: int = 5) -> bool:
 # -------------------------------------------------------------------
 def parse_timestamped_lines(text: str) -> List[Tuple[float, float, str]]:
     def to_seconds(ts: str) -> float:
-        # accept comma or dot milliseconds
         ts = ts.replace(',', '.')
         h, m, s = ts.split(':')
         return int(h) * 3600 + int(m) * 60 + float(s)
 
     parsed: List[Tuple[float, float, str]] = []
 
-    # 1) numeric "start-end: text"
     pat_num = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*:\s*(.+)$')
-
-    # 2) VTT inline (timestamp + text on same line)
-    pat_vtt_inline = re.compile(
-        r'^\s*(\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\s*-->\s*(\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)(?:\s*\|\s*|\s+)?(.*)$'
-    )
-
-    # 3) VTT/SRT block: timestamp line only; text lines follow until blank
-    pat_block_ts = re.compile(
-        r'^\s*(\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\s*-->\s*(\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)(?:.*)$'
-    )
-
-    # 4) [HH:MM:SS(.ms)] text
+    pat_vtt_inline = re.compile(r'^\s*(\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\s*-->\s*(\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)(?:\s*\|\s*|\s+)?(.*)$')
+    pat_block_ts = re.compile(r'^\s*(\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\s*-->\s*(\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)(?:.*)$')
     pat_bracket = re.compile(r'^\s*\[?(\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\]?\s+(.+)$')
 
     lines = text.splitlines()
@@ -159,8 +140,6 @@ def parse_timestamped_lines(text: str) -> List[Tuple[float, float, str]]:
         if not line:
             i += 1
             continue
-
-        # Skip SRT numeric cue indices
         if line.isdigit():
             i += 1
             continue
@@ -234,9 +213,9 @@ def write_vtt_from_segments(segments, out_path, window_start: float, window_end:
             f.write(f"{idx}\n{_fmt_ts(st)} --> {_fmt_ts(en)}\n{tx}\n\n")
     return True
 
-
-
-
+# -------------------------------------------------------------------
+# Zero-based transcript helpers
+# -------------------------------------------------------------------
 def _fmt_ts_dot_ms(t: float) -> str:
     """Format seconds to HH:MM:SS.mmm with dot milliseconds (for timestamped.txt)."""
     if t < 0: t = 0.0
@@ -284,6 +263,7 @@ def write_section_transcripts_zeroed(section_dir: str, window_start: float, wind
         z = dict(seg)
         z["start"] = float(seg["start"]) - window_start
         z["end"] = float(seg["end"]) - window_start
+        z["text"] = (z.get("text") or "").strip()
         zeroed.append(z)
 
     # transcript.json
@@ -328,80 +308,7 @@ def upload_transcripts_for_section(s3_conf: dict, mp4_key: str, local_paths: dic
         upload_s3(bucket, key, local_path, region, content_type=ctype)
         return f"s3://{bucket}/{key}"
 
-            # --- Load segments JSON + optional meta for per-section transcripts ---
-            segments_json = None
-            top_meta = None
-            try:
-                with open(transcript_path, "r", encoding="utf-8", errors="ignore") as _tf:
-                    _maybe = json.load(_tf)
-                    if isinstance(_maybe, dict) and isinstance(_maybe.get("segments"), list):
-                        segments_json = _maybe["segments"]
-                        top_meta = {k: _maybe.get(k) for k in ("detected_language","device","model") if k in _maybe}
-            except Exception:
-                segments_json = None
-                top_meta = None
-
-            # --- Per-section transcripts & VTTs (ALL zero-based and placed in transcripts/) ---
-            transcript_urls = {}
-            vtt_urls = {}
-
-            def _section_dir_from_mp4(path_mp4: str) -> Optional[str]:
-                return os.path.dirname(path_mp4) if path_mp4 else None
-
-            def _mk_vtt_local(path_mp4, start_s, end_s):
-                \"\"\"Write a zero-based VTT under <mp4 dir>/transcripts/captions.vtt\"\"\"
-                if not segments_json:
-                    return None
-                sec_dir = _section_dir_from_mp4(path_mp4)
-                if not sec_dir:
-                    return None
-                tdir = os.path.join(sec_dir, "transcripts")
-                os.makedirs(tdir, exist_ok=True)
-                vtt_path = os.path.join(tdir, "captions.vtt")
-                ok_vtt = write_vtt_from_segments(segments_json, vtt_path, start_s, end_s, shift_to_zero=True)
-                return vtt_path if ok_vtt else None
-
-            def _upload_vtt_for_section(s3_conf: dict, mp4_key: str, local_vtt: Optional[str]):
-                \"\"\"Upload transcripts/captions.vtt with text/vtt content type.\"\"\"
-                if not (s3_conf and s3_conf.get("bucket") and mp4_key and local_vtt and os.path.exists(local_vtt)):
-                    return None
-                bucket = s3_conf["bucket"]
-                region = s3_conf.get("region")
-                base_dir = os.path.dirname(mp4_key)
-                vtt_key = f\"{base_dir}/transcripts/captions.vtt\"
-                upload_s3(bucket, vtt_key, local_vtt, region, content_type="text/vtt")
-                print(f"[UPLOAD] S3 VTT: s3://{bucket}/{vtt_key}")
-                return f\"s3://{bucket}/{vtt_key}\"
-
-            def _section_all(section_name: str, path_mp4: str, start_s: float, end_s: float, s3key_name: str):
-                # Write transcripts (zero-based) locally
-                if segments_json:
-                    sec_dir = _section_dir_from_mp4(path_mp4)
-                    if sec_dir:
-                        local_paths = write_section_transcripts_zeroed(sec_dir, start_s, end_s, segments_json, full_meta=top_meta)
-                        if inp.get("s3"):
-                            s3_inp = inp["s3"]
-                            mp4_key = s3_inp.get("keys", {}).get(s3key_name)
-                            if mp4_key:
-                                up_uris = upload_transcripts_for_section(s3_inp, mp4_key, local_paths)
-                                transcript_urls[section_name] = up_uris
-                # Write & upload VTT into transcripts/
-                local_vtt = _mk_vtt_local(path_mp4, start_s, end_s)
-                if local_vtt and inp.get("s3"):
-                    s3_inp = inp["s3"]
-                    mp4_key = s3_inp.get("keys", {}).get(s3key_name)
-                    if mp4_key:
-                        vtt_uri = _upload_vtt_for_section(s3_inp, mp4_key, local_vtt)
-                        vtt_urls[f\"{section_name}_vtt\"] = vtt_uri
-
-            # Create bundles for all FOUR segments (including pre if non-zero)
-            if seg_pre > 0.10:
-                _section_all("pre", pre_p, 0.0, seg_pre, "pre")
-            _section_all("worship", worship_p, worship_start, worship_end, "worship")
-            _section_all("announcements", ann_p, worship_end, announcements_end, "ann")
-            _section_all("sermon", sermon_p, announcements_end, dur, "sermon")
-
-            return {
+    return {
         "json": _put(local_paths.get("json"), "transcript.json", "application/json"),
         "txt": _put(local_paths.get("txt"), "transcript.txt", "text/plain"),
         "timestamped": _put(local_paths.get("timestamped"), "timestamped.txt", "text/plain"),
@@ -411,11 +318,6 @@ def upload_transcripts_for_section(s3_conf: dict, mp4_key: str, local_paths: dic
 # JSON transcript (Whisper/Faster-Whisper) parsing
 # -------------------------------------------------------------------
 def parse_whisper_json_str(s: str) -> List[Tuple[float, float, str]]:
-    """
-    Accept a Whisper/Faster-Whisper style JSON string with a top-level dict
-    containing 'segments': [{start, end, text, ...}, ...] or a list.
-    Returns [(start, end, text), ...]
-    """
     try:
         obj = json.loads(s)
     except Exception:
@@ -462,7 +364,6 @@ def find_phrase_time(parsed: List[Tuple[float, float, str]],
         for phrase in phrases:
             norm_phrase = normalize_text(phrase)
             checks += 1
-            # only print a tiny rolling sample
             if debug and checks <= 12:
                 print(f"[MATCH] try: '{truncate(norm_phrase, 36)}' vs '{truncate(norm_text, 56)}'")
             if partial_match(norm_phrase, norm_text, num_words=5):
@@ -533,9 +434,6 @@ def ffmpeg_trim_copy(src: str, out: str, start: float, duration: float,
 
 def safe_trim(src: str, out: str, start: float, duration: float,
               webhook_override: Optional[str] = None) -> bool:
-    """
-    Guard against zero/near-zero durations to avoid noisy errors.
-    """
     if duration <= 0.10:
         log_and_slack(f"[SKIP] {out} duration too small ({duration:.2f}s)", webhook_override)
         return False
@@ -545,7 +443,7 @@ def upload_put(put_url: str, file_path: str) -> str:
     with open(file_path, "rb") as f:
         r = requests.put(put_url, data=f, timeout=300)
         r.raise_for_status()
-    return put_url  # caller can also supply a separate GET url
+    return put_url
 
 def upload_s3(bucket: str, key: str, file_path: str, region: Optional[str] = None,
               content_type: Optional[str] = None) -> str:
@@ -557,7 +455,6 @@ def upload_s3(bucket: str, key: str, file_path: str, region: Optional[str] = Non
     s3.upload_file(file_path, bucket, key, ExtraArgs={"ContentType": content_type})
     return f"s3://{bucket}/{key}"
 
-
 # -------------------------------------------------------------------
 # Main handler
 # -------------------------------------------------------------------
@@ -568,7 +465,6 @@ def handler(event):
     raw_video_url = inp.get("raw_video_url")
     slack_webhook = inp.get("slack_webhook") or None
 
-    # debug toggle
     debug_mode = bool(inp.get("debug", True) or os.environ.get("DEBUG_SPLITTER"))
 
     if not job_id:
@@ -580,10 +476,8 @@ def handler(event):
 
     try:
         with tempfile.TemporaryDirectory() as td:
-            # download inputs
             video_path = os.path.join(td, "raw.mp4")
 
-            # choose transcript filename extension by URL & parse JSON if needed
             t_ext = os.path.splitext(urlparse(transcript_url).path)[1].lower() or ".txt"
             if t_ext not in {".json", ".txt", ".vtt", ".srt"}:
                 t_ext = ".txt"
@@ -599,11 +493,9 @@ def handler(event):
             print(f"[FILES] video_path={video_path}")
             print(f"[FILES] transcript_path={transcript_path}")
 
-            # peek at transcript head
             if debug_mode:
                 debug_file_head(transcript_path, max_lines=int(inp.get("debug_head_lines") or 12))
 
-            # parse transcript (JSON first, else VTT/SRT/TXT)
             with open(transcript_path, "r", encoding="utf-8", errors="ignore") as f:
                 raw_tx = f.read()
 
@@ -623,14 +515,12 @@ def handler(event):
             if not parsed:
                 log_and_slack(":warning: Transcript parsed as empty; check format/regex or JSON shape.", slack_webhook)
 
-            # duration
             dur = ffprobe_duration(video_path)
             if dur is None:
                 return {"error": "video_duration_unknown"}
             print(f"[VIDEO] duration={dur:.3f}s")
 
             # === compute boundaries ===
-            # 1) worship_start (+15s offset to get past intro/transition)
             worship_start = find_phrase_time(
                 parsed, PHRASES["worship_start"], which="start",
                 return_offset=15, fallback=0.0, webhook_override=slack_webhook, debug=debug_mode
@@ -638,7 +528,6 @@ def handler(event):
             if worship_start is None:
                 worship_start = 0.0
 
-            # 2) worship_end (if missing, try sermon_split; else end of file)
             worship_end = find_phrase_time(
                 parsed, PHRASES["worship_end"], which="start",
                 fallback=None, webhook_override=slack_webhook, debug=debug_mode
@@ -651,7 +540,6 @@ def handler(event):
                 if worship_end is None:
                     worship_end = dur
 
-            # 3) announcements_end = sermon_split (else end)
             announcements_end = find_phrase_time(
                 parsed, PHRASES["sermon_split"], which="start",
                 fallback=None, webhook_override=slack_webhook, debug=debug_mode
@@ -659,7 +547,6 @@ def handler(event):
             if announcements_end is None:
                 announcements_end = dur
 
-            # safe clamp + monotonic order
             clamp = lambda x: max(0.0, min(float(x), float(dur)))
             worship_start = clamp(worship_start)
             worship_end = clamp(worship_end)
@@ -687,13 +574,11 @@ def handler(event):
             ann_p = os.path.join(td, "announcements_trimmed.mp4")
             sermon_p = os.path.join(td, "sermon_trimmed.mp4")
 
-            # trims (copy: fast; if you see artifacts on non-keyframes, switch to re-encode)
             ok_pre = safe_trim(video_path, pre_p, 0.0, seg_pre, slack_webhook)
             ok_worship = safe_trim(video_path, worship_p, worship_start, seg_worship, slack_webhook)
             ok_ann = safe_trim(video_path, ann_p, worship_end, seg_ann, slack_webhook)
             ok_sermon = safe_trim(video_path, sermon_p, announcements_end, seg_sermon, slack_webhook)
 
-            # uploads (upload only if a target is provided)
             urls = {}
 
             def up(file_path, put_url, get_url, s3key_name):
@@ -705,7 +590,13 @@ def handler(event):
                     return get_url
                 elif inp.get("s3") and inp["s3"].get("bucket") and inp["s3"].get("keys", {}).get(s3key_name):
                     s3_inp = inp["s3"]
-                    uri = upload_s3(s3_inp["bucket"], s3_inp["keys"][s3key_name], file_path, s3_inp.get("region"), content_type="video/mp4")
+                    uri = upload_s3(
+                        s3_inp["bucket"],
+                        s3_inp["keys"][s3key_name],
+                        file_path,
+                        s3_inp.get("region"),
+                        content_type="video/mp4"
+                    )
                     log_and_slack(f"[UPLOAD] S3 -> {s3key_name}: {uri}", slack_webhook)
                     return uri
                 else:
@@ -726,38 +617,6 @@ def handler(event):
             urls["worship_url"] = up(worship_p, put_worship, get_worship, "worship")
             urls["announcements_url"] = up(ann_p, put_ann, get_ann, "ann")
             urls["sermon_url"] = up(sermon_p, put_sermon, get_sermon, "sermon")
-
-            # --- Per-split VTTs from transcript JSON (skip pre-worship) ---
-            segments_json = None
-            try:
-                with open(transcript_path, "r", encoding="utf-8", errors="ignore") as _tf:
-                    _maybe = json.load(_tf)
-                    if isinstance(_maybe, dict) and isinstance(_maybe.get("segments"), list):
-                        segments_json = _maybe["segments"]
-            except Exception:
-                segments_json = None
-
-            vtt_urls = {}
-            def _mk_vtt_and_upload(path_mp4, key_name, start_s, end_s):
-                if not segments_json or not inp.get("s3"):
-                    return None
-                vtt_path = os.path.splitext(path_mp4)[0] + ".vtt"
-                ok_vtt = write_vtt_from_segments(segments_json, vtt_path, start_s, end_s, shift_to_zero=True)
-                if not ok_vtt:
-                    return None
-                s3 = inp["s3"]
-                mp4_key = s3.get("keys", {}).get(key_name)
-                if not mp4_key:
-                    return None
-                vtt_key = os.path.splitext(mp4_key)[0] + ".vtt"
-                upload_s3(s3["bucket"], vtt_key, vtt_path, s3.get("region"))
-                print(f"[UPLOAD] S3 -> {key_name} VTT: s3://{s3['bucket']}/{vtt_key}")
-                return f"s3://{s3['bucket']}/{vtt_key}"
-
-            # Only create VTTs for main three splits
-            vtt_urls["worship_vtt"] = _mk_vtt_and_upload(worship_p, "worship", worship_start, worship_end)
-            vtt_urls["announcements_vtt"] = _mk_vtt_and_upload(ann_p, "ann", worship_end, announcements_end)
-            vtt_urls["sermon_vtt"] = _mk_vtt_and_upload(sermon_p, "sermon", announcements_end, dur)
 
             # --- Load segments JSON + optional meta for per-section transcripts ---
             segments_json = None
@@ -780,7 +639,7 @@ def handler(event):
                 return os.path.dirname(path_mp4) if path_mp4 else None
 
             def _mk_vtt_local(path_mp4, start_s, end_s):
-                \"\"\"Write a zero-based VTT under <mp4 dir>/transcripts/captions.vtt\"\"\"
+                """Write a zero-based VTT under <mp4 dir>/transcripts/captions.vtt"""
                 if not segments_json:
                     return None
                 sec_dir = _section_dir_from_mp4(path_mp4)
@@ -793,16 +652,16 @@ def handler(event):
                 return vtt_path if ok_vtt else None
 
             def _upload_vtt_for_section(s3_conf: dict, mp4_key: str, local_vtt: Optional[str]):
-                \"\"\"Upload transcripts/captions.vtt with text/vtt content type.\"\"\"
+                """Upload transcripts/captions.vtt with text/vtt content type."""
                 if not (s3_conf and s3_conf.get("bucket") and mp4_key and local_vtt and os.path.exists(local_vtt)):
                     return None
                 bucket = s3_conf["bucket"]
                 region = s3_conf.get("region")
                 base_dir = os.path.dirname(mp4_key)
-                vtt_key = f\"{base_dir}/transcripts/captions.vtt\"
+                vtt_key = f"{base_dir}/transcripts/captions.vtt"
                 upload_s3(bucket, vtt_key, local_vtt, region, content_type="text/vtt")
                 print(f"[UPLOAD] S3 VTT: s3://{bucket}/{vtt_key}")
-                return f\"s3://{bucket}/{vtt_key}\"
+                return f"s3://{bucket}/{vtt_key}"
 
             def _section_all(section_name: str, path_mp4: str, start_s: float, end_s: float, s3key_name: str):
                 # Write transcripts (zero-based) locally
@@ -823,28 +682,29 @@ def handler(event):
                     mp4_key = s3_inp.get("keys", {}).get(s3key_name)
                     if mp4_key:
                         vtt_uri = _upload_vtt_for_section(s3_inp, mp4_key, local_vtt)
-                        vtt_urls[f\"{section_name}_vtt\"] = vtt_uri
+                        vtt_urls[f"{section_name}_vtt"] = vtt_uri
 
-            # Create bundles for all FOUR segments (including pre if non-zero)
-            if seg_pre > 0.10:
+            if seg_pre > 0.10 and ok_pre:
                 _section_all("pre", pre_p, 0.0, seg_pre, "pre")
-            _section_all("worship", worship_p, worship_start, worship_end, "worship")
-            _section_all("announcements", ann_p, worship_end, announcements_end, "ann")
-            _section_all("sermon", sermon_p, announcements_end, dur, "sermon")
+            if ok_worship:
+                _section_all("worship", worship_p, worship_start, worship_end, "worship")
+            if ok_ann:
+                _section_all("announcements", ann_p, worship_end, announcements_end, "ann")
+            if ok_sermon:
+                _section_all("sermon", sermon_p, announcements_end, dur, "sermon")
 
             return {
                 "ok": True,
                 "urls": urls,
                 "vtts": vtt_urls,
-                
                 "transcripts": transcript_urls,
-"bounds": {
+                "bounds": {
                     "duration": dur,
                     "worship_start": worship_start,
                     "worship_end": worship_end,
                     "announcements_end": announcements_end
                 },
-                "notes": "ffmpeg -c copy trims based on transcript phrase matches (JSON/VTT/SRT parser, safe trims, debug feed)"
+                "notes": "ffmpeg -c copy trims; per-section zero-based transcripts & VTT"
             }
 
     except requests.RequestException as e:
