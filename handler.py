@@ -1,4 +1,4 @@
-import os, re, uuid, tempfile, subprocess, json
+import os, re, uuid, tempfile, subprocess, json, mimetypes
 from typing import List, Tuple, Optional
 from urllib.parse import urlparse
 import requests
@@ -61,6 +61,39 @@ def log_and_slack(msg: str, webhook_override: Optional[str] = None):
     post_to_slack(msg, webhook_override)
 
 # -------------------------------------------------------------------
+# Small debug helpers
+# -------------------------------------------------------------------
+def human_bytes(n: int) -> str:
+    if n is None:
+        return "?"
+    if n < 1024: return f"{n} B"
+    for unit in ["KB","MB","GB","TB"]:
+        n /= 1024.0
+        if n < 1024.0:
+            return f"{n:.2f} {unit}"
+    return f"{n:.2f} PB"
+
+def debug_file_head(path: str, max_lines: int = 12):
+    try:
+        print(f"[DEBUG] Head of {path} (first {max_lines} lines):")
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for i, ln in enumerate(f):
+                if i >= max_lines: break
+                print("  ", ln.rstrip("\n"))
+    except Exception as e:
+        print(f"[DEBUG] Unable to read head of {path}: {e}")
+
+def debug_parsed_sample(parsed, max_rows: int = 6, max_text: int = 120):
+    print(f"[DEBUG] Parsed cues: {len(parsed)} total")
+    for i, (s, e, t) in enumerate(parsed[:max_rows]):
+        txt = (t[:max_text] + "…") if len(t) > max_text else t
+        print(f"  [{i}] {s:.3f} -> {e:.3f} | {txt}")
+
+def truncate(s: str, n: int = 80) -> str:
+    s = s or ""
+    return s if len(s) <= n else (s[:n] + "…")
+
+# -------------------------------------------------------------------
 # Text normalization / matching
 # -------------------------------------------------------------------
 def normalize_text(s: str) -> str:
@@ -78,56 +111,95 @@ def partial_match(norm_phrase: str, norm_text: str, num_words: int = 5) -> bool:
     Default lowered to 5 for more tolerant matching.
     """
     pw = norm_phrase.split()
-    tw = norm_text.split()
-    if len(pw) < num_words:
-        num_words = len(pw)
-    if num_words == 0:
+    if not pw:
         return False
-    snippet = " ".join(pw[:num_words])
-    return snippet in " ".join(tw)
+    # try 5,4,3-word prefixes for tolerance
+    for n in (num_words, 4, 3):
+        n = min(n, len(pw))
+        if n <= 0: 
+            continue
+        snippet = " ".join(pw[:n])
+        if snippet in norm_text:
+            return True
+    return False
 
 # -------------------------------------------------------------------
-# Transcript parsing (supports both "start-end: text" and WebVTT lines)
-# Example WebVTT line in your data:
-# 00:13:25.710 --> 00:13:27.790 | We're so glad that you've come to join us today.
+# Transcript parsing (supports numeric, VTT inline, VTT/SRT block)
 # -------------------------------------------------------------------
 def parse_timestamped_lines(text: str) -> List[Tuple[float, float, str]]:
     def to_seconds(ts: str) -> float:
-        # ts = HH:MM:SS(.ms)
-        h, m, s = ts.split(":")
+        # accept comma or dot milliseconds
+        ts = ts.replace(',', '.')
+        h, m, s = ts.split(':')
         return int(h) * 3600 + int(m) * 60 + float(s)
 
     parsed: List[Tuple[float, float, str]] = []
 
-    # Pattern 1: numeric "start-end: text" (original format)
-    pat_num = re.compile(r'(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?):\s*(.*)$')
+    # 1) numeric "start-end: text"
+    pat_num = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*:\s*(.+)$')
 
-    # Pattern 2: WebVTT one-line timestamp + optional pipe + text
-    pat_vtt = re.compile(
-        r'(\d{2}:\d{2}:\d{2}(?:\.\d+)?)\s*-->\s*(\d{2}:\d{2}:\d{2}(?:\.\d+)?)(?:\s*\|\s*|\s+)?(.*)$'
+    # 2) VTT inline (timestamp + text on same line)
+    pat_vtt_inline = re.compile(
+        r'^\s*(\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\s*-->\s*(\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)(?:\s*\|\s*|\s+)?(.*)$'
     )
 
+    # 3) VTT/SRT block: timestamp line only; text lines follow until blank
+    pat_block_ts = re.compile(
+        r'^\s*(\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\s*-->\s*(\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)(?:.*)$'
+    )
+
+    # 4) [HH:MM:SS(.ms)] text
+    pat_bracket = re.compile(r'^\s*\[?(\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\]?\s+(.+)$')
+
     lines = text.splitlines()
-    for line in lines:
-        l = line.strip()
-        if not l:
+    i = 0
+    n = len(lines)
+
+    while i < n:
+        line = lines[i].strip()
+        if not line:
+            i += 1
             continue
 
-        m1 = pat_num.match(l)
-        if m1:
-            start = float(m1.group(1))
-            end = float(m1.group(2))
-            txt = m1.group(3)
+        # Skip SRT numeric cue indices
+        if line.isdigit():
+            i += 1
+            continue
+
+        m = pat_num.match(line)
+        if m:
+            start = float(m.group(1)); end = float(m.group(2)); txt = m.group(3)
+            parsed.append((start, end, txt))
+            i += 1
+            continue
+
+        m = pat_vtt_inline.match(line)
+        if m:
+            start = to_seconds(m.group(1)); end = to_seconds(m.group(2)); txt = m.group(3)
+            parsed.append((start, end, txt))
+            i += 1
+            continue
+
+        m = pat_block_ts.match(line)
+        if m:
+            start = to_seconds(m.group(1)); end = to_seconds(m.group(2))
+            i += 1
+            text_buf = []
+            while i < n and lines[i].strip():
+                text_buf.append(lines[i].strip())
+                i += 1
+            txt = " ".join(text_buf).strip()
             parsed.append((start, end, txt))
             continue
 
-        m2 = pat_vtt.match(l)
-        if m2:
-            start = to_seconds(m2.group(1))
-            end = to_seconds(m2.group(2))
-            txt = m2.group(3)
-            parsed.append((start, end, txt))
+        m = pat_bracket.match(line)
+        if m:
+            start = to_seconds(m.group(1)); end = start + 2.0
+            parsed.append((start, end, m.group(2).strip()))
+            i += 1
             continue
+
+        i += 1
 
     return parsed
 
@@ -140,22 +212,29 @@ def find_phrase_time(parsed: List[Tuple[float, float, str]],
                      return_offset: float = 0.0,
                      fallback: Optional[float] = None,
                      debug_lines: int = 3,
-                     webhook_override: Optional[str] = None) -> Optional[float]:
+                     webhook_override: Optional[str] = None,
+                     debug: bool = True) -> Optional[float]:
+    checks = 0
     for start, end, text in parsed:
         norm_text = normalize_text(text)
         for phrase in phrases:
             norm_phrase = normalize_text(phrase)
-            # debug trace (trim to keep logs reasonable)
-            print(f"[MATCH DEBUG] '{norm_phrase[:36]}...' vs '{norm_text[:56]}...'")
+            checks += 1
+            # only print a tiny rolling sample
+            if debug and checks <= 12:
+                print(f"[MATCH] try: '{truncate(norm_phrase, 36)}' vs '{truncate(norm_text, 56)}'")
             if partial_match(norm_phrase, norm_text, num_words=5):
                 found = (start if which == "start" else end) + float(return_offset or 0)
-                log_and_slack(f"[INFO] Matched '{phrase[:60]}...' at {found:.2f}s (offset={return_offset})",
-                              webhook_override)
+                log_and_slack(
+                    f"[INFO] Matched “{truncate(phrase, 60)}” at {found:.2f}s (offset={return_offset})",
+                    webhook_override
+                )
                 return found
 
-    print("[DEBUG] No partial match found. Sample lines:")
-    for i, (s, e, t) in enumerate(parsed[:debug_lines]):
-        print(f"  sample {i}: {s}-{e}: {t}")
+    if debug:
+        print("[DEBUG] No match; first few cues:")
+        for i, (s, e, t) in enumerate(parsed[:debug_lines]):
+            print(f"  sample {i}: {s}-{e}: {truncate(t, 90)}")
     log_and_slack(f":warning: Phrase(s) not found: {phrases}", webhook_override)
     return fallback
 
@@ -163,12 +242,19 @@ def find_phrase_time(parsed: List[Tuple[float, float, str]],
 # IO helpers
 # -------------------------------------------------------------------
 def http_get_to(path: str, url: str):
+    print(f"[FETCH] GET {url}")
     with requests.get(url, stream=True, timeout=120) as r:
         r.raise_for_status()
+        size = int(r.headers.get("Content-Length") or 0)
+        ctype = r.headers.get("Content-Type")
+        print(f"[FETCH] -> {path} ({human_bytes(size)}; {ctype or 'unknown MIME'})")
         with open(path, "wb") as f:
             for chunk in r.iter_content(1024 * 1024):
                 if chunk:
                     f.write(chunk)
+    st = os.stat(path)
+    guessed = mimetypes.guess_type(path)[0]
+    print(f"[FETCH] Saved {path} ({human_bytes(st.st_size)}; guessed {guessed or 'n/a'})")
 
 def ffprobe_duration(path: str) -> Optional[float]:
     try:
@@ -235,6 +321,9 @@ def handler(event):
     raw_video_url = inp.get("raw_video_url")
     slack_webhook = inp.get("slack_webhook") or None
 
+    # debug toggle
+    debug_mode = bool(inp.get("debug", True) or os.environ.get("DEBUG_SPLITTER"))
+
     if not job_id:
         return {"error": "missing_job_id"}
     if not transcript_url or not str(transcript_url).startswith("http"):
@@ -242,33 +331,31 @@ def handler(event):
     if not raw_video_url or not str(raw_video_url).startswith("http"):
         return {"error": f"raw_video_url missing/invalid: {raw_video_url}"}
 
-    # Upload targets (choose PUT or S3; supply any subset you want uploaded)
-    # Presigned PUTs:
-    put_pre = inp.get("pre_worship_put_url")
-    put_worship = inp.get("worship_put_url")
-    put_ann = inp.get("announcements_put_url")
-    put_sermon = inp.get("sermon_put_url")
-    # Optional separate GET urls (if PUT url is not public)
-    get_pre = inp.get("pre_worship_get_url") or put_pre
-    get_worship = inp.get("worship_get_url") or put_worship
-    get_ann = inp.get("announcements_get_url") or put_ann
-    get_sermon = inp.get("sermon_get_url") or put_sermon
-
-    # OR S3 outputs (bucket/key per artifact):
-    # { "bucket": "...", "region": "...", "keys": { "pre":"...", "worship":"...", "ann":"...", "sermon":"..." } }
-    s3 = inp.get("s3") or {}
-
     try:
         with tempfile.TemporaryDirectory() as td:
             # download inputs
             video_path = os.path.join(td, "raw.mp4")
             transcript_path = os.path.join(td, "transcript.txt")
+            print(f"[INPUT] job_id={job_id}")
+            print(f"[INPUT] transcript_url={transcript_url}")
+            print(f"[INPUT] raw_video_url={raw_video_url}")
+
             http_get_to(video_path, raw_video_url)
             http_get_to(transcript_path, transcript_url)
 
+            print(f"[FILES] video_path={video_path}")
+            print(f"[FILES] transcript_path={transcript_path}")
+
+            # peek at transcript head
+            if debug_mode:
+                debug_file_head(transcript_path, max_lines=int(inp.get("debug_head_lines") or 12))
+
             # parse transcript
             with open(transcript_path, "r", encoding="utf-8", errors="ignore") as f:
-                parsed = parse_timestamped_lines(f.read())
+                raw_tx = f.read()
+            parsed = parse_timestamped_lines(raw_tx)
+            if debug_mode:
+                debug_parsed_sample(parsed, max_rows=int(inp.get("debug_parsed_rows") or 6))
 
             if not parsed:
                 log_and_slack(":warning: Transcript parsed as empty; check format/regex.", slack_webhook)
@@ -277,12 +364,13 @@ def handler(event):
             dur = ffprobe_duration(video_path)
             if dur is None:
                 return {"error": "video_duration_unknown"}
+            print(f"[VIDEO] duration={dur:.3f}s")
 
             # === compute boundaries ===
             # 1) worship_start (+15s offset to get past intro/transition)
             worship_start = find_phrase_time(
                 parsed, PHRASES["worship_start"], which="start",
-                return_offset=15, fallback=0.0, webhook_override=slack_webhook
+                return_offset=15, fallback=0.0, webhook_override=slack_webhook, debug=debug_mode
             )
             if worship_start is None:
                 worship_start = 0.0
@@ -290,12 +378,12 @@ def handler(event):
             # 2) worship_end (if missing, try sermon_split; else end of file)
             worship_end = find_phrase_time(
                 parsed, PHRASES["worship_end"], which="start",
-                fallback=None, webhook_override=slack_webhook
+                fallback=None, webhook_override=slack_webhook, debug=debug_mode
             )
             if worship_end is None:
                 worship_end = find_phrase_time(
                     parsed, PHRASES["sermon_split"], which="start",
-                    fallback=None, webhook_override=slack_webhook
+                    fallback=None, webhook_override=slack_webhook, debug=debug_mode
                 )
                 if worship_end is None:
                     worship_end = dur
@@ -303,22 +391,32 @@ def handler(event):
             # 3) announcements_end = sermon_split (else end)
             announcements_end = find_phrase_time(
                 parsed, PHRASES["sermon_split"], which="start",
-                fallback=None, webhook_override=slack_webhook
+                fallback=None, webhook_override=slack_webhook, debug=debug_mode
             )
             if announcements_end is None:
                 announcements_end = dur
 
-            # safe clamp
+            # safe clamp + monotonic order
             clamp = lambda x: max(0.0, min(float(x), float(dur)))
             worship_start = clamp(worship_start)
             worship_end = clamp(worship_end)
             announcements_end = clamp(announcements_end)
+            if worship_end < worship_start:
+                worship_end = worship_start
+            if announcements_end < worship_end:
+                announcements_end = worship_end
+
+            seg_pre = max(0.0, worship_start - 0.0)
+            seg_worship = max(0.0, worship_end - worship_start)
+            seg_ann = max(0.0, announcements_end - worship_end)
+            seg_sermon = max(0.0, dur - announcements_end)
 
             log_and_slack(
                 f"[BOUNDS] duration={dur:.2f}s; worship_start={worship_start:.2f}s; "
                 f"worship_end={worship_end:.2f}s; announcements_end={announcements_end:.2f}s",
                 slack_webhook
             )
+            print(f"[SEGS] pre={seg_pre:.2f}s, worship={seg_worship:.2f}s, ann={seg_ann:.2f}s, sermon={seg_sermon:.2f}s")
 
             # === outputs ===
             pre_p = os.path.join(td, "pre_worship_trimmed.mp4")
@@ -327,10 +425,10 @@ def handler(event):
             sermon_p = os.path.join(td, "sermon_trimmed.mp4")
 
             # trims (copy: fast; if you see artifacts on non-keyframes, switch to re-encode)
-            ok_pre = safe_trim(video_path, pre_p, 0.0, max(0.0, worship_start - 0.0), slack_webhook)
-            ok_worship = safe_trim(video_path, worship_p, worship_start, max(0.0, worship_end - worship_start), slack_webhook)
-            ok_ann = safe_trim(video_path, ann_p, worship_end, max(0.0, announcements_end - worship_end), slack_webhook)
-            ok_sermon = safe_trim(video_path, sermon_p, announcements_end, max(0.0, dur - announcements_end), slack_webhook)
+            ok_pre = safe_trim(video_path, pre_p, 0.0, seg_pre, slack_webhook)
+            ok_worship = safe_trim(video_path, worship_p, worship_start, seg_worship, slack_webhook)
+            ok_ann = safe_trim(video_path, ann_p, worship_end, seg_ann, slack_webhook)
+            ok_sermon = safe_trim(video_path, sermon_p, announcements_end, seg_sermon, slack_webhook)
 
             # uploads (upload only if a target is provided)
             urls = {}
@@ -341,10 +439,21 @@ def handler(event):
                 if put_url:
                     upload_put(put_url, file_path)
                     return get_url
-                elif s3 and s3.get("bucket") and s3.get("keys", {}).get(s3key_name):
+                elif inp.get("s3") and inp["s3"].get("bucket") and inp["s3"].get("keys", {}).get(s3key_name):
+                    s3 = inp["s3"]
                     return upload_s3(s3["bucket"], s3["keys"][s3key_name], file_path, s3.get("region"))
                 else:
                     return None
+
+            put_pre = inp.get("pre_worship_put_url")
+            put_worship = inp.get("worship_put_url")
+            put_ann = inp.get("announcements_put_url")
+            put_sermon = inp.get("sermon_put_url")
+
+            get_pre = inp.get("pre_worship_get_url") or put_pre
+            get_worship = inp.get("worship_get_url") or put_worship
+            get_ann = inp.get("announcements_get_url") or put_ann
+            get_sermon = inp.get("sermon_get_url") or put_sermon
 
             urls["pre_worship_url"] = up(pre_p, put_pre, get_pre, "pre")
             urls["worship_url"] = up(worship_p, put_worship, get_worship, "worship")
@@ -360,7 +469,7 @@ def handler(event):
                     "worship_end": worship_end,
                     "announcements_end": announcements_end
                 },
-                "notes": "ffmpeg -c copy trims based on transcript phrase matches (WebVTT-aware parser, safe trims)"
+                "notes": "ffmpeg -c copy trims based on transcript phrase matches (block-aware VTT/SRT parser, safe trims, debug feed)"
             }
 
     except requests.RequestException as e:
