@@ -1,3 +1,4 @@
 runpod
 boto3
 requests
+psutil==6.0.0

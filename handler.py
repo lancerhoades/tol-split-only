@@ -1,4 +1,4 @@
-import os, re, uuid, tempfile, subprocess, json, mimetypes
+import os, re, uuid, tempfile, subprocess, json, mimetypes, time, shutil, platform
 from typing import List, Tuple, Optional
 from urllib.parse import urlparse
 import requests
@@ -459,6 +459,9 @@ def upload_s3(bucket: str, key: str, file_path: str, region: Optional[str] = Non
 # Main handler
 # -------------------------------------------------------------------
 def handler(event):
+    # env & node basics
+    try: log_env_basics()
+    except Exception as _e: print(f"[ENV] log error: {_e}")
     inp = (event or {}).get("input") or {}
     job_id = inp.get("job_id")
     transcript_url = inp.get("transcript_url")
@@ -487,8 +490,8 @@ def handler(event):
             print(f"[INPUT] transcript_url={transcript_url}")
             print(f"[INPUT] raw_video_url={raw_video_url}")
 
-            http_get_to(video_path, raw_video_url)
-            http_get_to(transcript_path, transcript_url)
+            http_get_to(video_path, raw_video_url, slack_webhook)
+            http_get_to(transcript_path, transcript_url, slack_webhook)
 
             print(f"[FILES] video_path={video_path}")
             print(f"[FILES] transcript_path={transcript_path}")
@@ -714,4 +717,111 @@ def handler(event):
     except Exception as e:
         return {"error": "unexpected_error", "details": str(e)}
 
+# ==== inserted diagnostics & overrides ====
+def human_bytes(n: int) -> str:
+    if n is None:
+        return "?"
+    if n < 1024: return f"{n} B"
+    for unit in ["KB","MB","GB","TB","PB"]:
+        n /= 1024.0
+        if n < 1024.0:
+            return f"{n:.2f} {unit}"
+    return f"{n:.2f} EB"
+
+def log_env_basics():
+    try:
+        total_root, used_root, free_root = shutil.disk_usage("/")
+        total_tmp, used_tmp, free_tmp   = shutil.disk_usage("/tmp")
+        print(f"[ENV] cores={os.cpu_count()} py={platform.python_version()} "
+              f"disk(/) free={free_root/1e9:.2f}GB disk(/tmp) free={free_tmp/1e9:.2f}GB")
+    except Exception as e:
+        print(f"[ENV] info error: {e}")
+
+# Verbose downloader with Slack progress every ~60s.
+def http_get_to(path: str, url: str, webhook: Optional[str] = None):
+    import requests
+    print(f"[FETCH] GET {url}")
+    t0 = time.time()
+    last_console = t0
+    last_slack = t0
+    with requests.get(url, stream=True, timeout=120) as r:
+        r.raise_for_status()
+        size_hdr = int(r.headers.get("Content-Length") or 0)
+        ctype = r.headers.get("Content-Type")
+        print(f"[FETCH] -> {path} (CL={human_bytes(size_hdr)}; {ctype or 'unknown MIME'})")
+        total = 0
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(1024 * 1024):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                total += len(chunk)
+                now = time.time()
+                if now - last_console >= 5:
+                    mbps = (total/1048576.0) / max(1e-6, now - t0)
+                    print(f"[FETCH] progress {human_bytes(total)} in {now - t0:.1f}s ({mbps:.2f} MB/s)")
+                    last_console = now
+                if webhook and now - last_slack >= 60:
+                    try:
+                        mbps = (total/1048576.0) / max(1e-6, now - t0)
+                        post_to_slack(f":arrow_down: Downloading… {human_bytes(total)} so far @ {mbps:.2f} MB/s", webhook)
+                    except Exception:
+                        pass
+                    last_slack = now
+    st = os.stat(path)
+    elapsed = time.time() - t0
+    mbps = (st.st_size/1048576.0) / max(1e-6, elapsed)
+    print(f"[FETCH] Saved {path} ({human_bytes(st.st_size)} in {elapsed:.1f}s @ {mbps:.2f} MB/s)")
+    if size_hdr and st.st_size != size_hdr:
+        print(f"[WARN] Size mismatch: wrote {st.st_size} vs header {size_hdr}")
+
+# ffprobe with deep JSON dump when duration fails.
+def ffprobe_duration(path: str):
+    try:
+        out = subprocess.check_output(
+            ["ffprobe","-v","error","-show_entries","format=duration","-of","default=nw=1:nk=1", path],
+            stderr=subprocess.STDOUT
+        )
+        return float(out.strip())
+    except Exception as e:
+        print(f"[WARN] ffprobe failed (duration): {e}")
+        try:
+            probe = subprocess.check_output(
+                ["ffprobe","-v","warning","-show_streams","-show_format","-of","json", path],
+                stderr=subprocess.STDOUT
+            )
+            s = probe.decode("utf-8", errors="ignore")
+            print("[DEBUG] ffprobe json (trunc):", s[:4000])
+        except Exception as e2:
+            print(f"[WARN] ffprobe deep failed: {e2}")
+        return None
+
+# ffmpeg trim that captures stderr/stdout for root-cause.
+def ffmpeg_trim_copy(src: str, out: str, start: float, duration: float,
+                     webhook_override: Optional[str] = None):
+    log_and_slack(f"[TRIM] {out} start={start:.2f} dur={duration:.2f}", webhook_override)
+    if duration <= 0:
+        log_and_slack(f"[ERROR] Invalid duration: {duration}", webhook_override)
+        return False
+    cmd = ["ffmpeg","-y","-hide_banner","-loglevel","warning","-nostdin",
+           "-ss", str(start), "-i", src, "-t", str(duration),
+           "-c","copy", out]
+    try:
+        res = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        if res.stdout: print("[FFMPEG:OUT]", res.stdout[:2000])
+        if res.stderr: print("[FFMPEG:ERR]", res.stderr[:4000])
+    except subprocess.CalledProcessError as e:
+        print("[FFMPEG:CMD]", " ".join(cmd))
+        print("[FFMPEG:RC]", e.returncode)
+        if e.stdout: print("[FFMPEG:OUT]", e.stdout[:2000])
+        if e.stderr: print("[FFMPEG:ERR]", e.stderr[:4000])
+        log_and_slack(f"[ERROR] ffmpeg failed for {out}: rc={e.returncode}", webhook_override)
+        return False
+    ok = os.path.exists(out) and os.path.getsize(out) > 0
+    if not ok:
+        log_and_slack(f"[ERROR] Output missing/empty: {out}", webhook_override)
+    else:
+        log_and_slack(f"[OK] Wrote {out} ({os.path.getsize(out)} bytes)", webhook_override)
+    return ok
+# ==== end inserted ====
 runpod.serverless.start({"handler": handler})
