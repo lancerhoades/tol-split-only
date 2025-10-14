@@ -1,0 +1,5 @@
+
+# editor/run patches
+handler.py.bak*
+handler.py.*[0-9]
+*.bak
