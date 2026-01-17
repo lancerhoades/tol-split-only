@@ -349,6 +349,51 @@ def parse_whisper_json_str(s: str) -> List[Tuple[float, float, str]]:
     return out
 
 # -------------------------------------------------------------------
+# Verse extraction
+# -------------------------------------------------------------------
+_BIBLE_BOOKS = [
+    "Genesis","Exodus","Leviticus","Numbers","Deuteronomy",
+    "Joshua","Judges","Ruth","1 Samuel","2 Samuel","1 Kings","2 Kings",
+    "1 Chronicles","2 Chronicles","Ezra","Nehemiah","Esther","Job",
+    "Psalms","Proverbs","Ecclesiastes","Song of Solomon","Isaiah","Jeremiah",
+    "Lamentations","Ezekiel","Daniel","Hosea","Joel","Amos","Obadiah","Jonah",
+    "Micah","Nahum","Habakkuk","Zephaniah","Haggai","Zechariah","Malachi",
+    "Matthew","Mark","Luke","John","Acts","Romans","1 Corinthians","2 Corinthians",
+    "Galatians","Ephesians","Philippians","Colossians","1 Thessalonians","2 Thessalonians",
+    "1 Timothy","2 Timothy","Titus","Philemon","Hebrews","James","1 Peter","2 Peter",
+    "1 John","2 John","3 John","Jude","Revelation"
+]
+
+_BOOK_ALT = [
+    "Gen","Ex","Lev","Num","Deut","Josh","Judg","Ruth","1 Sam","2 Sam","1 Kgs","2 Kgs",
+    "1 Chr","2 Chr","Ezra","Neh","Esth","Job","Ps","Prov","Eccl","Song","Isa","Jer",
+    "Lam","Ezek","Dan","Hos","Joel","Amos","Obad","Jonah","Mic","Nah","Hab","Zeph",
+    "Hag","Zech","Mal","Matt","Mk","Lk","Jn","Rom","1 Cor","2 Cor","Gal","Eph","Phil",
+    "Col","1 Thess","2 Thess","1 Tim","2 Tim","Tit","Phlm","Heb","Jas","1 Pet","2 Pet",
+    "1 Jn","2 Jn","3 Jn","Jude","Rev"
+]
+
+_BOOK_PATTERN = "|".join([re.escape(b) for b in (_BIBLE_BOOKS + _BOOK_ALT)])
+_VERSE_RE = re.compile(
+    rf"\b(?:{_BOOK_PATTERN})\s+\d{{1,3}}(?:[:.]\d{{1,3}}(?:-\d{{1,3}})?)?\b",
+    re.IGNORECASE
+)
+
+def extract_verse_refs(text: str):
+    if not text:
+        return []
+    seen = set()
+    out = []
+    for m in _VERSE_RE.finditer(text):
+        ref = re.sub(r"\s+", " ", m.group(0)).strip()
+        key = ref.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ref)
+    return out
+
+# -------------------------------------------------------------------
 # Phrase locator
 # -------------------------------------------------------------------
 def find_phrase_time(parsed: List[Tuple[float, float, str]],
@@ -491,7 +536,15 @@ def handler(event):
             print(f"[INPUT] transcript_url={transcript_url}")
             print(f"[INPUT] raw_video_url={raw_video_url}")
 
-            progress = default_progress_logger(slack_fn=(lambda m: post_to_slack(m, slack_webhook)))\n            download_url_parallel(url=raw_video_url, dest_path=video_path, chunk_bytes=16777216, concurrency=16, progress_cb=progress, workdir_preferred=os.environ.get("TMPDIR","/mnt/volume_nyc1_01"))
+            progress = default_progress_logger(slack_fn=(lambda m: post_to_slack(m, slack_webhook)))
+            download_url_parallel(
+                url=raw_video_url,
+                dest_path=video_path,
+                chunk_bytes=16777216,
+                concurrency=16,
+                progress_cb=progress,
+                workdir_preferred=os.environ.get("TMPDIR","/mnt/volume_nyc1_01")
+            )
             download_url_parallel(url=transcript_url, dest_path=transcript_path, chunk_bytes=4194304, concurrency=8, progress_cb=None, workdir_preferred=os.environ.get("TMPDIR","/mnt/volume_nyc1_01"))
 
             print(f"[FILES] video_path={video_path}")
@@ -639,6 +692,7 @@ def handler(event):
             transcript_urls = {}
             vtt_urls = {}
             bounds_urls = {}
+            verses_urls = {}
 
             def _section_dir_from_mp4(path_mp4: str) -> Optional[str]:
                 return os.path.dirname(path_mp4) if path_mp4 else None
@@ -695,6 +749,30 @@ def handler(event):
                 print(f"[UPLOAD] S3 VTT: s3://{bucket}/{vtt_key}")
                 return f"s3://{bucket}/{vtt_key}"
 
+            def _write_verses_local(txt_path: Optional[str]):
+                if not (txt_path and os.path.exists(txt_path)):
+                    return None
+                with open(txt_path, "r", encoding="utf-8", errors="ignore") as tf:
+                    text = tf.read()
+                refs = extract_verse_refs(text)
+                payload = {"count": len(refs), "references": refs}
+                vdir = os.path.dirname(txt_path)
+                out_path = os.path.join(vdir, "verses.json")
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2)
+                return out_path
+
+            def _upload_verses(s3_conf: dict, mp4_key: str, local_json: Optional[str]):
+                if not (s3_conf and s3_conf.get("bucket") and mp4_key and local_json and os.path.exists(local_json)):
+                    return None
+                bucket = s3_conf["bucket"]
+                region = s3_conf.get("region")
+                base_dir = os.path.dirname(mp4_key)
+                json_key = f"{base_dir}/transcripts/verses.json"
+                upload_s3(bucket, json_key, local_json, region, content_type="application/json")
+                print(f"[UPLOAD] S3 verses: s3://{bucket}/{json_key}")
+                return f"s3://{bucket}/{json_key}"
+
             def _section_all(section_name: str, path_mp4: str, start_s: float, end_s: float, s3key_name: str):
                 # Write transcripts (zero-based) locally
                 if segments_json:
@@ -707,6 +785,11 @@ def handler(event):
                             if mp4_key:
                                 up_uris = upload_transcripts_for_section(s3_inp, mp4_key, local_paths)
                                 transcript_urls[section_name] = up_uris
+                                if section_name == "sermon":
+                                    verses_local = _write_verses_local(local_paths.get("txt"))
+                                    verses_uri = _upload_verses(s3_inp, mp4_key, verses_local)
+                                    if verses_uri:
+                                        verses_urls["sermon_verses"] = verses_uri
                 # Write & upload VTT into transcripts/
                 local_vtt = _mk_vtt_local(path_mp4, start_s, end_s)
                 if local_vtt and inp.get("s3"):
@@ -738,6 +821,7 @@ def handler(event):
                 "urls": urls,
                 "vtts": vtt_urls,
                 "timestamps": bounds_urls,
+                "verses": verses_urls,
                 "transcripts": transcript_urls,
                 "bounds": {
                     "duration": dur,
