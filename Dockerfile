@@ -12,5 +12,6 @@ RUN pip install -r /tmp/requirements.txt
 
 WORKDIR /app
 COPY handler.py /app/handler.py
+COPY download_from_s3.py /app/download_from_s3.py
 
 CMD ["python", "-u", "handler.py"]
