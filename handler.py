@@ -45,12 +45,19 @@ PHRASES = {
 
 # Slack: set via env or input["slack_webhook"]
 SLACK_WEBHOOK_ENV = os.environ.get("SLACK_WEBHOOK", "").strip()
+SLACK_VERBOSE = os.environ.get("SLACK_VERBOSE", "false").lower() in ("1","true","yes","on")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TEMPERATURE = float(os.environ.get("OPENAI_TEMPERATURE", "0.2"))
 OPENAI_MAX_TOKENS = int(os.environ.get("OPENAI_MAX_TOKENS", "120"))
 
+def _slack_is_important(message: str) -> bool:
+    msg = (message or "").lower()
+    return any(tok in msg for tok in (":x:", ":warning:", "[error]", "error:", "failed"))
+
 def post_to_slack(message: str, webhook_override: Optional[str] = None):
+    if not (SLACK_VERBOSE or _slack_is_important(message)):
+        return
     url = (webhook_override or SLACK_WEBHOOK_ENV or "").strip()
     if not url:
         return
@@ -588,7 +595,7 @@ def handler(event):
             print(f"[INPUT] transcript_url={transcript_url}")
             print(f"[INPUT] raw_video_url={raw_video_url}")
 
-            progress = default_progress_logger(slack_fn=(lambda m: post_to_slack(m, slack_webhook)))
+            progress = default_progress_logger(slack_fn=(lambda m: post_to_slack(m, slack_webhook)) if SLACK_VERBOSE else None)
             download_url_parallel(
                 url=raw_video_url,
                 dest_path=video_path,
