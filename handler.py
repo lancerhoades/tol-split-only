@@ -3,6 +3,7 @@ from typing import List, Tuple, Optional
 from urllib.parse import urlparse
 import requests
 import runpod
+from download_from_s3 import download_url_parallel, default_progress_logger
 
 # -------------------------------------------------------------------
 # Phrase variants (expanded for robustness against real transcript)
@@ -384,7 +385,7 @@ def find_phrase_time(parsed: List[Tuple[float, float, str]],
 # -------------------------------------------------------------------
 # IO helpers
 # -------------------------------------------------------------------
-def http_get_to(path: str, url: str):
+# def http_get_to(path: str, url: str):
     print(f"[FETCH] GET {url}")
     with requests.get(url, stream=True, timeout=120) as r:
         r.raise_for_status()
@@ -478,7 +479,7 @@ def handler(event):
         return {"error": f"raw_video_url missing/invalid: {raw_video_url}"}
 
     try:
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR","/mnt/volume_nyc1_01")) as td:
             video_path = os.path.join(td, "raw.mp4")
 
             t_ext = os.path.splitext(urlparse(transcript_url).path)[1].lower() or ".txt"
@@ -490,8 +491,8 @@ def handler(event):
             print(f"[INPUT] transcript_url={transcript_url}")
             print(f"[INPUT] raw_video_url={raw_video_url}")
 
-            http_get_to(video_path, raw_video_url, slack_webhook)
-            http_get_to(transcript_path, transcript_url, slack_webhook)
+            progress = default_progress_logger(slack_fn=(lambda m: post_to_slack(m, slack_webhook)))\n            download_url_parallel(url=raw_video_url, dest_path=video_path, chunk_bytes=16777216, concurrency=16, progress_cb=progress, workdir_preferred=os.environ.get("TMPDIR","/mnt/volume_nyc1_01"))
+            download_url_parallel(url=transcript_url, dest_path=transcript_path, chunk_bytes=4194304, concurrency=8, progress_cb=None, workdir_preferred=os.environ.get("TMPDIR","/mnt/volume_nyc1_01"))
 
             print(f"[FILES] video_path={video_path}")
             print(f"[FILES] transcript_path={transcript_path}")
@@ -637,9 +638,37 @@ def handler(event):
             # --- Per-section transcripts & VTTs (ALL zero-based and placed in transcripts/) ---
             transcript_urls = {}
             vtt_urls = {}
+            bounds_urls = {}
 
             def _section_dir_from_mp4(path_mp4: str) -> Optional[str]:
                 return os.path.dirname(path_mp4) if path_mp4 else None
+
+            def _write_bounds_json_local(path_mp4: str, section: str, start_s: float, end_s: float):
+                sec_dir = _section_dir_from_mp4(path_mp4)
+                if not sec_dir:
+                    return None
+                os.makedirs(sec_dir, exist_ok=True)
+                out_path = os.path.join(sec_dir, "timestamps.json")
+                payload = {
+                    "section": section,
+                    "start": float(start_s),
+                    "end": float(end_s),
+                    "duration": max(0.0, float(end_s) - float(start_s))
+                }
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2)
+                return out_path
+
+            def _upload_bounds_json(s3_conf: dict, mp4_key: str, local_json: Optional[str]):
+                if not (s3_conf and s3_conf.get("bucket") and mp4_key and local_json and os.path.exists(local_json)):
+                    return None
+                bucket = s3_conf["bucket"]
+                region = s3_conf.get("region")
+                base_dir = os.path.dirname(mp4_key)
+                json_key = f"{base_dir}/timestamps.json"
+                upload_s3(bucket, json_key, local_json, region, content_type="application/json")
+                print(f"[UPLOAD] S3 timestamps: s3://{bucket}/{json_key}")
+                return f"s3://{bucket}/{json_key}"
 
             def _mk_vtt_local(path_mp4, start_s, end_s):
                 """Write a zero-based VTT under <mp4 dir>/transcripts/captions.vtt"""
@@ -686,6 +715,14 @@ def handler(event):
                     if mp4_key:
                         vtt_uri = _upload_vtt_for_section(s3_inp, mp4_key, local_vtt)
                         vtt_urls[f"{section_name}_vtt"] = vtt_uri
+                # Write & upload timestamps.json alongside mp4
+                local_bounds = _write_bounds_json_local(path_mp4, section_name, start_s, end_s)
+                if local_bounds and inp.get("s3"):
+                    s3_inp = inp["s3"]
+                    mp4_key = s3_inp.get("keys", {}).get(s3key_name)
+                    if mp4_key:
+                        bounds_uri = _upload_bounds_json(s3_inp, mp4_key, local_bounds)
+                        bounds_urls[f"{section_name}_timestamps"] = bounds_uri
 
             if seg_pre > 0.10 and ok_pre:
                 _section_all("pre", pre_p, 0.0, seg_pre, "pre")
@@ -700,6 +737,7 @@ def handler(event):
                 "ok": True,
                 "urls": urls,
                 "vtts": vtt_urls,
+                "timestamps": bounds_urls,
                 "transcripts": transcript_urls,
                 "bounds": {
                     "duration": dur,
@@ -738,7 +776,7 @@ def log_env_basics():
         print(f"[ENV] info error: {e}")
 
 # Verbose downloader with Slack progress every ~60s.
-def http_get_to(path: str, url: str, webhook: Optional[str] = None):
+# def http_get_to(path: str, url: str, webhook: Optional[str] = None):
     import requests
     print(f"[FETCH] GET {url}")
     t0 = time.time()
