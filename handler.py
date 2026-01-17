@@ -45,6 +45,10 @@ PHRASES = {
 
 # Slack: set via env or input["slack_webhook"]
 SLACK_WEBHOOK_ENV = os.environ.get("SLACK_WEBHOOK", "").strip()
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_TEMPERATURE = float(os.environ.get("OPENAI_TEMPERATURE", "0.2"))
+OPENAI_MAX_TOKENS = int(os.environ.get("OPENAI_MAX_TOKENS", "120"))
 
 def post_to_slack(message: str, webhook_override: Optional[str] = None):
     url = (webhook_override or SLACK_WEBHOOK_ENV or "").strip()
@@ -502,6 +506,54 @@ def upload_s3(bucket: str, key: str, file_path: str, region: Optional[str] = Non
     return f"s3://{bucket}/{key}"
 
 # -------------------------------------------------------------------
+# LLM helpers
+# -------------------------------------------------------------------
+def _openai_chat(prompt: str) -> Optional[str]:
+    if not OPENAI_API_KEY:
+        return None
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": OPENAI_MODEL,
+        "temperature": OPENAI_TEMPERATURE,
+        "max_tokens": OPENAI_MAX_TOKENS,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You write concise, factual summaries for sermon content."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    }
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        choices = data.get("choices") or []
+        if not choices:
+            return None
+        return (choices[0].get("message") or {}).get("content")
+    except Exception as e:
+        print(f"[LLM] OpenAI request failed: {e}")
+        return None
+
+def generate_sermon_goals(text: str) -> Optional[str]:
+    if not text:
+        return None
+    prompt = (
+        "Read the sermon transcript and write exactly two sentences that explain the goals "
+        "of the sermon. Be concise and use plain language.\n\n"
+        f"Transcript:\n{text[:8000]}"
+    )
+    return _openai_chat(prompt)
+
+# -------------------------------------------------------------------
 # Main handler
 # -------------------------------------------------------------------
 def handler(event):
@@ -693,6 +745,7 @@ def handler(event):
             vtt_urls = {}
             bounds_urls = {}
             verses_urls = {}
+            goals_urls = {}
 
             def _section_dir_from_mp4(path_mp4: str) -> Optional[str]:
                 return os.path.dirname(path_mp4) if path_mp4 else None
@@ -773,6 +826,34 @@ def handler(event):
                 print(f"[UPLOAD] S3 verses: s3://{bucket}/{json_key}")
                 return f"s3://{bucket}/{json_key}"
 
+            def _write_goals_local(txt_path: Optional[str]):
+                if not (txt_path and os.path.exists(txt_path)):
+                    return None
+                with open(txt_path, "r", encoding="utf-8", errors="ignore") as tf:
+                    text = tf.read()
+                goals = generate_sermon_goals(text)
+                if not goals:
+                    return None
+                payload = {
+                    "goals": goals.strip()
+                }
+                vdir = os.path.dirname(txt_path)
+                out_path = os.path.join(vdir, "sermon_goals.json")
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2)
+                return out_path
+
+            def _upload_goals(s3_conf: dict, mp4_key: str, local_json: Optional[str]):
+                if not (s3_conf and s3_conf.get("bucket") and mp4_key and local_json and os.path.exists(local_json)):
+                    return None
+                bucket = s3_conf["bucket"]
+                region = s3_conf.get("region")
+                base_dir = os.path.dirname(mp4_key)
+                json_key = f"{base_dir}/transcripts/sermon_goals.json"
+                upload_s3(bucket, json_key, local_json, region, content_type="application/json")
+                print(f"[UPLOAD] S3 sermon goals: s3://{bucket}/{json_key}")
+                return f"s3://{bucket}/{json_key}"
+
             def _section_all(section_name: str, path_mp4: str, start_s: float, end_s: float, s3key_name: str):
                 # Write transcripts (zero-based) locally
                 if segments_json:
@@ -790,6 +871,10 @@ def handler(event):
                                     verses_uri = _upload_verses(s3_inp, mp4_key, verses_local)
                                     if verses_uri:
                                         verses_urls["sermon_verses"] = verses_uri
+                                    goals_local = _write_goals_local(local_paths.get("txt"))
+                                    goals_uri = _upload_goals(s3_inp, mp4_key, goals_local)
+                                    if goals_uri:
+                                        goals_urls["sermon_goals"] = goals_uri
                 # Write & upload VTT into transcripts/
                 local_vtt = _mk_vtt_local(path_mp4, start_s, end_s)
                 if local_vtt and inp.get("s3"):
@@ -822,6 +907,7 @@ def handler(event):
                 "vtts": vtt_urls,
                 "timestamps": bounds_urls,
                 "verses": verses_urls,
+                "sermon_goals": goals_urls,
                 "transcripts": transcript_urls,
                 "bounds": {
                     "duration": dur,
