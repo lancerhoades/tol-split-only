@@ -43,6 +43,8 @@ PHRASES = {
     ]
 }
 
+DEFAULT_PHRASES = PHRASES
+
 # Slack: set via env or input["slack_webhook"]
 SLACK_WEBHOOK_ENV = os.environ.get("SLACK_WEBHOOK", "").strip()
 SLACK_VERBOSE = os.environ.get("SLACK_VERBOSE", "false").lower() in ("1","true","yes","on")
@@ -50,13 +52,17 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TEMPERATURE = float(os.environ.get("OPENAI_TEMPERATURE", "0.2"))
 OPENAI_MAX_TOKENS = int(os.environ.get("OPENAI_MAX_TOKENS", "120"))
+OUTRO_A_URL = os.environ.get("OUTRO_A_URL", "").strip()
+OUTRO_B_URL = os.environ.get("OUTRO_B_URL", "").strip()
+OUTRO_MATCH_SAMPLE_RATE = int(os.environ.get("OUTRO_MATCH_SAMPLE_RATE", "1000"))
+OUTRO_MATCH_MIN_SCORE = float(os.environ.get("OUTRO_MATCH_MIN_SCORE", "0.35"))
 
 def _slack_is_important(message: str) -> bool:
     msg = (message or "").lower()
     return any(tok in msg for tok in (":x:", ":warning:", "[error]", "error:", "failed"))
 
-def post_to_slack(message: str, webhook_override: Optional[str] = None):
-    if not (SLACK_VERBOSE or _slack_is_important(message)):
+def post_to_slack(message: str, webhook_override: Optional[str] = None, force: bool = False):
+    if not (force or SLACK_VERBOSE or _slack_is_important(message)):
         return
     url = (webhook_override or SLACK_WEBHOOK_ENV or "").strip()
     if not url:
@@ -513,6 +519,80 @@ def upload_s3(bucket: str, key: str, file_path: str, region: Optional[str] = Non
     return f"s3://{bucket}/{key}"
 
 # -------------------------------------------------------------------
+# Outro matching
+# -------------------------------------------------------------------
+def _download_to_local(url: str, dest_path: str, tmp_root: str):
+    if url.startswith("s3://"):
+        _, _, rest = url.partition("s3://")
+        bucket, _, key = rest.partition("/")
+        import boto3
+        boto3.client("s3").download_file(bucket, key, dest_path)
+        return dest_path
+    download_url_parallel(
+        url=url,
+        dest_path=dest_path,
+        chunk_bytes=4 * 1024 * 1024,
+        concurrency=4,
+        progress_cb=None,
+        workdir_preferred=tmp_root
+    )
+    return dest_path
+
+def _extract_audio_raw(input_path: str, raw_path: str, sample_rate: int):
+    cmd = [
+        "ffmpeg","-hide_banner","-loglevel","error","-y",
+        "-i", input_path,
+        "-vn","-ac","1","-ar", str(sample_rate),
+        "-f","s16le", raw_path
+    ]
+    subprocess.check_call(cmd)
+
+def _match_outro_offset(full_raw: str, outro_raw: str, sample_rate: int, min_idx: int):
+    import numpy as np
+    x = np.fromfile(full_raw, dtype=np.int16).astype(np.float32)
+    y = np.fromfile(outro_raw, dtype=np.int16).astype(np.float32)
+    if len(y) == 0 or len(x) == 0 or len(y) > len(x):
+        return None, None
+
+    x = x - x.mean()
+    y = y - y.mean()
+    y_rev = y[::-1]
+
+    n = 1 << int((len(x) + len(y) - 1).bit_length())
+    X = np.fft.rfft(x, n)
+    Y = np.fft.rfft(y_rev, n)
+    corr = np.fft.irfft(X * Y, n)
+    corr = corr[len(y)-1:len(x)]
+
+    win = np.ones(len(y), dtype=np.float32)
+    energy = np.convolve(x * x, win, mode="valid")
+    denom = np.sqrt(energy * np.sum(y * y)) + 1e-8
+    score = corr / denom
+
+    if min_idx > 0 and min_idx < len(score):
+        score[:min_idx] = -1.0
+
+    idx = int(np.argmax(score))
+    best = float(score[idx])
+    return idx / float(sample_rate), best
+
+# -------------------------------------------------------------------
+# Phrase overrides
+# -------------------------------------------------------------------
+def load_phrases_override(phrases_url: Optional[str]) -> Optional[dict]:
+    if not phrases_url:
+        return None
+    try:
+        r = requests.get(phrases_url, timeout=30)
+        r.raise_for_status()
+        obj = r.json()
+        if isinstance(obj, dict):
+            return obj
+    except Exception as e:
+        print(f"[PHRASES] Failed to load phrases_url: {e}")
+    return None
+
+# -------------------------------------------------------------------
 # LLM helpers
 # -------------------------------------------------------------------
 def _openai_chat(prompt: str) -> Optional[str]:
@@ -572,6 +652,12 @@ def handler(event):
     transcript_url = inp.get("transcript_url")
     raw_video_url = inp.get("raw_video_url")
     slack_webhook = inp.get("slack_webhook") or None
+    phrases_url = inp.get("phrases_url")
+    phrases = load_phrases_override(phrases_url) or DEFAULT_PHRASES
+    outro_a_url = (inp.get("outro_a_url") or OUTRO_A_URL or "").strip()
+    outro_b_url = (inp.get("outro_b_url") or OUTRO_B_URL or "").strip()
+    outro_min_score = float(inp.get("outro_min_score") or OUTRO_MATCH_MIN_SCORE)
+    outro_sample_rate = int(inp.get("outro_sample_rate") or OUTRO_MATCH_SAMPLE_RATE)
 
     debug_mode = bool(inp.get("debug", True) or os.environ.get("DEBUG_SPLITTER"))
 
@@ -583,7 +669,9 @@ def handler(event):
         return {"error": f"raw_video_url missing/invalid: {raw_video_url}"}
 
     try:
-        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR","/mnt/volume_nyc1_01")) as td:
+        tmp_root = os.environ.get("TMPDIR") or "/tmp"
+        os.makedirs(tmp_root, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=tmp_root) as td:
             video_path = os.path.join(td, "raw.mp4")
 
             t_ext = os.path.splitext(urlparse(transcript_url).path)[1].lower() or ".txt"
@@ -602,9 +690,16 @@ def handler(event):
                 chunk_bytes=16777216,
                 concurrency=16,
                 progress_cb=progress,
-                workdir_preferred=os.environ.get("TMPDIR","/mnt/volume_nyc1_01")
+                workdir_preferred=tmp_root
             )
-            download_url_parallel(url=transcript_url, dest_path=transcript_path, chunk_bytes=4194304, concurrency=8, progress_cb=None, workdir_preferred=os.environ.get("TMPDIR","/mnt/volume_nyc1_01"))
+            download_url_parallel(
+                url=transcript_url,
+                dest_path=transcript_path,
+                chunk_bytes=4194304,
+                concurrency=8,
+                progress_cb=None,
+                workdir_preferred=tmp_root
+            )
 
             print(f"[FILES] video_path={video_path}")
             print(f"[FILES] transcript_path={transcript_path}")
@@ -636,32 +731,66 @@ def handler(event):
                 return {"error": "video_duration_unknown"}
             print(f"[VIDEO] duration={dur:.3f}s")
 
-            # === compute boundaries ===
+            # === compute boundaries (phrases) ===
             worship_start = find_phrase_time(
-                parsed, PHRASES["worship_start"], which="start",
+                parsed, phrases["worship_start"], which="start",
                 return_offset=15, fallback=0.0, webhook_override=slack_webhook, debug=debug_mode
             )
             if worship_start is None:
                 worship_start = 0.0
 
             worship_end = find_phrase_time(
-                parsed, PHRASES["worship_end"], which="start",
+                parsed, phrases["worship_end"], which="start",
                 fallback=None, webhook_override=slack_webhook, debug=debug_mode
             )
             if worship_end is None:
                 worship_end = find_phrase_time(
-                    parsed, PHRASES["sermon_split"], which="start",
+                    parsed, phrases["sermon_split"], which="start",
                     fallback=None, webhook_override=slack_webhook, debug=debug_mode
                 )
                 if worship_end is None:
                     worship_end = dur
 
             announcements_end = find_phrase_time(
-                parsed, PHRASES["sermon_split"], which="start",
+                parsed, phrases["sermon_split"], which="start",
                 fallback=None, webhook_override=slack_webhook, debug=debug_mode
             )
             if announcements_end is None:
                 announcements_end = dur
+
+            # === optional outro match to set announcements_end ===
+            outro_used = None
+            outro_score = None
+            outro_start = None
+            outro_dur = None
+            if (outro_a_url or outro_b_url) and dur is not None:
+                try:
+                    full_raw = os.path.join(td, "full_audio.s16le")
+                    _extract_audio_raw(video_path, full_raw, outro_sample_rate)
+                    min_idx = int(max(0.0, worship_end) * outro_sample_rate)
+
+                    best = {"score": -1.0, "url": None, "start": None, "dur": None}
+                    for label, url in (("A", outro_a_url), ("B", outro_b_url)):
+                        if not url:
+                            continue
+                        local_outro = os.path.join(td, f"outro_{label}.mp4")
+                        _download_to_local(url, local_outro, tmp_root)
+                        outro_raw = os.path.join(td, f"outro_{label}.s16le")
+                        _extract_audio_raw(local_outro, outro_raw, outro_sample_rate)
+                        offset, score = _match_outro_offset(full_raw, outro_raw, outro_sample_rate, min_idx)
+                        odur = ffprobe_duration(local_outro)
+                        if offset is not None and score is not None:
+                            if score > best["score"]:
+                                best = {"score": score, "url": url, "start": offset, "dur": odur}
+                    if best["url"] and best["score"] >= outro_min_score and best["dur"]:
+                        outro_used = best["url"]
+                        outro_score = best["score"]
+                        outro_start = best["start"]
+                        outro_dur = best["dur"]
+                        announcements_end = min(dur, outro_start + outro_dur)
+                        print(f"[OUTRO] matched {outro_used} score={outro_score:.3f} start={outro_start:.2f} dur={outro_dur:.2f}")
+                except Exception as e:
+                    print(f"[OUTRO] match failed: {e}")
 
             clamp = lambda x: max(0.0, min(float(x), float(dur)))
             worship_start = clamp(worship_start)
@@ -681,6 +810,13 @@ def handler(event):
                 f"[BOUNDS] duration={dur:.2f}s; worship_start={worship_start:.2f}s; "
                 f"worship_end={worship_end:.2f}s; announcements_end={announcements_end:.2f}s",
                 slack_webhook
+            )
+            post_to_slack(
+                f"[SPLIT] worship_start={worship_start:.2f}s worship_end={worship_end:.2f}s "
+                f"announcements_end={announcements_end:.2f}s phrases_url={'yes' if phrases_url else 'no'} "
+                f"outro={'yes' if outro_used else 'no'} score={outro_score if outro_score is not None else 'n/a'}",
+                slack_webhook,
+                force=True
             )
             print(f"[SEGS] pre={seg_pre:.2f}s, worship={seg_worship:.2f}s, ann={seg_ann:.2f}s, sermon={seg_sermon:.2f}s")
 
