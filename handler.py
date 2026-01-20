@@ -775,7 +775,7 @@ def handler(event):
                     best = {"score": -1.0, "url": None, "start": None, "dur": None}
                     for label, url in (("A", outro_a_url), ("B", outro_b_url)):
                         if not url:
-                            post_to_slack(f"[OUTRO] skip {label} (url missing)", slack_webhook)
+                            post_to_slack(f"⏭️ [OUTRO] skip {label} (url missing)", slack_webhook)
                             continue
                         local_outro = os.path.join(td, f"outro_{label}.mp4")
                         _download_to_local(url, local_outro, tmp_root)
@@ -784,7 +784,7 @@ def handler(event):
                         offset, score = _match_outro_offset(full_raw, outro_raw, outro_sample_rate, min_idx)
                         odur = ffprobe_duration(local_outro)
                         post_to_slack(
-                            f"[OUTRO] tried {label} score={score if score is not None else 'n/a'} "
+                            f"🎧 [OUTRO] tried {label} score={score if score is not None else 'n/a'} "
                             f"start={offset if offset is not None else 'n/a'} dur={odur if odur is not None else 'n/a'}",
                             slack_webhook
                         )
@@ -800,7 +800,7 @@ def handler(event):
                         print(f"[OUTRO] matched {outro_used} score={outro_score:.3f} start={outro_start:.2f} dur={outro_dur:.2f}")
                 except Exception as e:
                     print(f"[OUTRO] match failed: {e}")
-                    post_to_slack(f"[OUTRO] match failed: {e}", slack_webhook)
+                    post_to_slack(f"⚠️ [OUTRO] match failed: {e}", slack_webhook)
 
             clamp = lambda x: max(0.0, min(float(x), float(dur)))
             worship_start = clamp(worship_start)
@@ -831,8 +831,15 @@ def handler(event):
                     method = "OUTRO"
             elif phrases_url:
                 method = "JSON_WORDS"
+            method_emoji = {
+                "OUTRO_A": "🎬🅰️",
+                "OUTRO_B": "🎬🅱️",
+                "OUTRO": "🎬",
+                "JSON_WORDS": "🧾",
+                "DEFAULT_WORDS": "🧩"
+            }.get(method, "🧩")
             post_to_slack(
-                f"[SPLIT_METHOD] method={method} worship_start={worship_start:.2f}s "
+                f"{method_emoji} [SPLIT_METHOD] method={method} worship_start={worship_start:.2f}s "
                 f"worship_end={worship_end:.2f}s announcements_end={announcements_end:.2f}s "
                 f"outro_score={outro_score if outro_score is not None else 'n/a'}",
                 slack_webhook,
