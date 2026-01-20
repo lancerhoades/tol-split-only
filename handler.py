@@ -49,6 +49,7 @@ DEFAULT_PHRASES = PHRASES
 SLACK_WEBHOOK_ENV = os.environ.get("SLACK_WEBHOOK", "").strip()
 SLACK_VERBOSE = os.environ.get("SLACK_VERBOSE", "false").lower() in ("1","true","yes","on")
 PHRASES_URL = os.environ.get("PHRASES_URL", "").strip()
+POD_NAME = os.environ.get("POD_NAME", "tol-split-only")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TEMPERATURE = float(os.environ.get("OPENAI_TEMPERATURE", "0.2"))
@@ -69,7 +70,8 @@ def post_to_slack(message: str, webhook_override: Optional[str] = None, force: b
     if not url:
         return
     try:
-        requests.post(url, json={"text": message}, timeout=5)
+        msg = f"[{POD_NAME}] {message}"
+        requests.post(url, json={"text": msg}, timeout=5)
     except Exception:
         pass
 
