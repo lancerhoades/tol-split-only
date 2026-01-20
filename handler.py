@@ -48,6 +48,7 @@ DEFAULT_PHRASES = PHRASES
 # Slack: set via env or input["slack_webhook"]
 SLACK_WEBHOOK_ENV = os.environ.get("SLACK_WEBHOOK", "").strip()
 SLACK_VERBOSE = os.environ.get("SLACK_VERBOSE", "false").lower() in ("1","true","yes","on")
+PHRASES_URL = os.environ.get("PHRASES_URL", "").strip()
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TEMPERATURE = float(os.environ.get("OPENAI_TEMPERATURE", "0.2"))
@@ -652,7 +653,7 @@ def handler(event):
     transcript_url = inp.get("transcript_url")
     raw_video_url = inp.get("raw_video_url")
     slack_webhook = inp.get("slack_webhook") or None
-    phrases_url = inp.get("phrases_url")
+    phrases_url = (inp.get("phrases_url") or PHRASES_URL or "").strip()
     phrases = load_phrases_override(phrases_url) or DEFAULT_PHRASES
     outro_a_url = (inp.get("outro_a_url") or OUTRO_A_URL or "").strip()
     outro_b_url = (inp.get("outro_b_url") or OUTRO_B_URL or "").strip()
@@ -772,6 +773,7 @@ def handler(event):
                     best = {"score": -1.0, "url": None, "start": None, "dur": None}
                     for label, url in (("A", outro_a_url), ("B", outro_b_url)):
                         if not url:
+                            post_to_slack(f"[OUTRO] skip {label} (url missing)", slack_webhook)
                             continue
                         local_outro = os.path.join(td, f"outro_{label}.mp4")
                         _download_to_local(url, local_outro, tmp_root)
@@ -779,6 +781,11 @@ def handler(event):
                         _extract_audio_raw(local_outro, outro_raw, outro_sample_rate)
                         offset, score = _match_outro_offset(full_raw, outro_raw, outro_sample_rate, min_idx)
                         odur = ffprobe_duration(local_outro)
+                        post_to_slack(
+                            f"[OUTRO] tried {label} score={score if score is not None else 'n/a'} "
+                            f"start={offset if offset is not None else 'n/a'} dur={odur if odur is not None else 'n/a'}",
+                            slack_webhook
+                        )
                         if offset is not None and score is not None:
                             if score > best["score"]:
                                 best = {"score": score, "url": url, "start": offset, "dur": odur}
@@ -791,6 +798,7 @@ def handler(event):
                         print(f"[OUTRO] matched {outro_used} score={outro_score:.3f} start={outro_start:.2f} dur={outro_dur:.2f}")
                 except Exception as e:
                     print(f"[OUTRO] match failed: {e}")
+                    post_to_slack(f"[OUTRO] match failed: {e}", slack_webhook)
 
             clamp = lambda x: max(0.0, min(float(x), float(dur)))
             worship_start = clamp(worship_start)
@@ -811,10 +819,20 @@ def handler(event):
                 f"worship_end={worship_end:.2f}s; announcements_end={announcements_end:.2f}s",
                 slack_webhook
             )
+            method = "DEFAULT_WORDS"
+            if outro_used:
+                if outro_a_url and outro_used == outro_a_url:
+                    method = "OUTRO_A"
+                elif outro_b_url and outro_used == outro_b_url:
+                    method = "OUTRO_B"
+                else:
+                    method = "OUTRO"
+            elif phrases_url:
+                method = "JSON_WORDS"
             post_to_slack(
-                f"[SPLIT] worship_start={worship_start:.2f}s worship_end={worship_end:.2f}s "
-                f"announcements_end={announcements_end:.2f}s phrases_url={'yes' if phrases_url else 'no'} "
-                f"outro={'yes' if outro_used else 'no'} score={outro_score if outro_score is not None else 'n/a'}",
+                f"[SPLIT_METHOD] method={method} worship_start={worship_start:.2f}s "
+                f"worship_end={worship_end:.2f}s announcements_end={announcements_end:.2f}s "
+                f"outro_score={outro_score if outro_score is not None else 'n/a'}",
                 slack_webhook,
                 force=True
             )
