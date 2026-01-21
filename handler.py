@@ -921,9 +921,7 @@ def handler(event):
                 return os.path.dirname(path_mp4) if path_mp4 else None
 
             def _write_bounds_json_local(path_mp4: str, section: str, start_s: float, end_s: float):
-                sec_dir = _section_dir_from_mp4(path_mp4)
-                if not sec_dir:
-                    return None
+                sec_dir = _section_dir_from_mp4(path_mp4) or os.path.join(td, section)
                 os.makedirs(sec_dir, exist_ok=True)
                 out_path = os.path.join(sec_dir, "timestamps.json")
                 payload = {
@@ -936,13 +934,18 @@ def handler(event):
                     json.dump(payload, f, indent=2)
                 return out_path
 
-            def _upload_bounds_json(s3_conf: dict, mp4_key: str, local_json: Optional[str]):
-                if not (s3_conf and s3_conf.get("bucket") and mp4_key and local_json and os.path.exists(local_json)):
+            def _bounds_key(base_dir: str, section: str) -> str:
+                if base_dir.endswith(f"/{section}") or base_dir == section:
+                    return f"{base_dir}/timestamps.json"
+                return f"{base_dir}/{section}/timestamps.json"
+
+            def _upload_bounds_json(s3_conf: dict, mp4_key: Optional[str], local_json: Optional[str], section: str):
+                if not (s3_conf and s3_conf.get("bucket") and local_json and os.path.exists(local_json)):
                     return None
                 bucket = s3_conf["bucket"]
                 region = s3_conf.get("region")
-                base_dir = os.path.dirname(mp4_key)
-                json_key = f"{base_dir}/timestamps.json"
+                base_dir = os.path.dirname(mp4_key) if mp4_key else "splits"
+                json_key = _bounds_key(base_dir, section)
                 upload_s3(bucket, json_key, local_json, region, content_type="application/json")
                 print(f"[UPLOAD] S3 timestamps: s3://{bucket}/{json_key}")
                 return f"s3://{bucket}/{json_key}"
@@ -1058,17 +1061,24 @@ def handler(event):
                 if local_bounds and inp.get("s3"):
                     s3_inp = inp["s3"]
                     mp4_key = s3_inp.get("keys", {}).get(s3key_name)
-                    if mp4_key:
-                        bounds_uri = _upload_bounds_json(s3_inp, mp4_key, local_bounds)
-                        bounds_urls[f"{section_name}_timestamps"] = bounds_uri
+                    bounds_uri = _upload_bounds_json(s3_inp, mp4_key, local_bounds, section_name)
+                    bounds_urls[f"{section_name}_timestamps"] = bounds_uri
 
             if seg_pre > 0.10 and ok_pre:
                 _section_all("pre", pre_p, 0.0, seg_pre, "pre")
+            else:
+                _section_all("pre", pre_p, 0.0, seg_pre, "pre")
             if ok_worship:
+                _section_all("worship", worship_p, worship_start, worship_end, "worship")
+            else:
                 _section_all("worship", worship_p, worship_start, worship_end, "worship")
             if ok_ann:
                 _section_all("announcements", ann_p, worship_end, announcements_end, "ann")
+            else:
+                _section_all("announcements", ann_p, worship_end, announcements_end, "ann")
             if ok_sermon:
+                _section_all("sermon", sermon_p, announcements_end, dur, "sermon")
+            else:
                 _section_all("sermon", sermon_p, announcements_end, dur, "sermon")
 
             return {
