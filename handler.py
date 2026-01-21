@@ -313,13 +313,19 @@ def write_section_transcripts_zeroed(section_dir: str, window_start: float, wind
 
     return {"json": json_path, "txt": txt_path, "timestamped": ts_path}
 
-def upload_transcripts_for_section(s3_conf: dict, mp4_key: str, local_paths: dict):
-    """Upload transcripts under <dir of mp4>/transcripts/ with proper content-types."""
-    if not (s3_conf and s3_conf.get("bucket") and mp4_key and local_paths):
+def _section_base_dir(mp4_key: Optional[str], section: str) -> str:
+    base_dir = os.path.dirname(mp4_key) if mp4_key else "splits"
+    if base_dir.endswith(f"/{section}") or base_dir == section:
+        return base_dir
+    return f"{base_dir}/{section}"
+
+def upload_transcripts_for_section(s3_conf: dict, mp4_key: Optional[str], local_paths: dict, section: str):
+    """Upload transcripts under <section dir>/transcripts/ with proper content-types."""
+    if not (s3_conf and s3_conf.get("bucket") and local_paths):
         return {}
     bucket = s3_conf["bucket"]
     region = s3_conf.get("region")
-    base_dir = os.path.dirname(mp4_key)  # e.g., splits/announcements
+    base_dir = _section_base_dir(mp4_key, section)
     tdir_key = base_dir + "/transcripts"
 
     def _put(local_path, rel_name, ctype):
@@ -963,13 +969,13 @@ def handler(event):
                 ok_vtt = write_vtt_from_segments(segments_json, vtt_path, start_s, end_s, shift_to_zero=True)
                 return vtt_path if ok_vtt else None
 
-            def _upload_vtt_for_section(s3_conf: dict, mp4_key: str, local_vtt: Optional[str]):
+            def _upload_vtt_for_section(s3_conf: dict, mp4_key: Optional[str], section: str, local_vtt: Optional[str]):
                 """Upload transcripts/captions.vtt with text/vtt content type."""
-                if not (s3_conf and s3_conf.get("bucket") and mp4_key and local_vtt and os.path.exists(local_vtt)):
+                if not (s3_conf and s3_conf.get("bucket") and local_vtt and os.path.exists(local_vtt)):
                     return None
                 bucket = s3_conf["bucket"]
                 region = s3_conf.get("region")
-                base_dir = os.path.dirname(mp4_key)
+                base_dir = _section_base_dir(mp4_key, section)
                 vtt_key = f"{base_dir}/transcripts/captions.vtt"
                 upload_s3(bucket, vtt_key, local_vtt, region, content_type="text/vtt")
                 print(f"[UPLOAD] S3 VTT: s3://{bucket}/{vtt_key}")
@@ -988,12 +994,12 @@ def handler(event):
                     json.dump(payload, f, indent=2)
                 return out_path
 
-            def _upload_verses(s3_conf: dict, mp4_key: str, local_json: Optional[str]):
-                if not (s3_conf and s3_conf.get("bucket") and mp4_key and local_json and os.path.exists(local_json)):
+            def _upload_verses(s3_conf: dict, mp4_key: Optional[str], section: str, local_json: Optional[str]):
+                if not (s3_conf and s3_conf.get("bucket") and local_json and os.path.exists(local_json)):
                     return None
                 bucket = s3_conf["bucket"]
                 region = s3_conf.get("region")
-                base_dir = os.path.dirname(mp4_key)
+                base_dir = _section_base_dir(mp4_key, section)
                 json_key = f"{base_dir}/transcripts/verses.json"
                 upload_s3(bucket, json_key, local_json, region, content_type="application/json")
                 print(f"[UPLOAD] S3 verses: s3://{bucket}/{json_key}")
@@ -1016,12 +1022,12 @@ def handler(event):
                     json.dump(payload, f, indent=2)
                 return out_path
 
-            def _upload_goals(s3_conf: dict, mp4_key: str, local_json: Optional[str]):
-                if not (s3_conf and s3_conf.get("bucket") and mp4_key and local_json and os.path.exists(local_json)):
+            def _upload_goals(s3_conf: dict, mp4_key: Optional[str], section: str, local_json: Optional[str]):
+                if not (s3_conf and s3_conf.get("bucket") and local_json and os.path.exists(local_json)):
                     return None
                 bucket = s3_conf["bucket"]
                 region = s3_conf.get("region")
-                base_dir = os.path.dirname(mp4_key)
+                base_dir = _section_base_dir(mp4_key, section)
                 json_key = f"{base_dir}/transcripts/sermon_goals.json"
                 upload_s3(bucket, json_key, local_json, region, content_type="application/json")
                 print(f"[UPLOAD] S3 sermon goals: s3://{bucket}/{json_key}")
@@ -1037,15 +1043,15 @@ def handler(event):
                             s3_inp = inp["s3"]
                             mp4_key = s3_inp.get("keys", {}).get(s3key_name)
                             if mp4_key:
-                                up_uris = upload_transcripts_for_section(s3_inp, mp4_key, local_paths)
+                                up_uris = upload_transcripts_for_section(s3_inp, mp4_key, local_paths, section_name)
                                 transcript_urls[section_name] = up_uris
                                 if section_name == "sermon":
                                     verses_local = _write_verses_local(local_paths.get("txt"))
-                                    verses_uri = _upload_verses(s3_inp, mp4_key, verses_local)
+                                    verses_uri = _upload_verses(s3_inp, mp4_key, section_name, verses_local)
                                     if verses_uri:
                                         verses_urls["sermon_verses"] = verses_uri
                                     goals_local = _write_goals_local(local_paths.get("txt"))
-                                    goals_uri = _upload_goals(s3_inp, mp4_key, goals_local)
+                                    goals_uri = _upload_goals(s3_inp, mp4_key, section_name, goals_local)
                                     if goals_uri:
                                         goals_urls["sermon_goals"] = goals_uri
                 # Write & upload VTT into transcripts/
@@ -1054,7 +1060,7 @@ def handler(event):
                     s3_inp = inp["s3"]
                     mp4_key = s3_inp.get("keys", {}).get(s3key_name)
                     if mp4_key:
-                        vtt_uri = _upload_vtt_for_section(s3_inp, mp4_key, local_vtt)
+                        vtt_uri = _upload_vtt_for_section(s3_inp, mp4_key, section_name, local_vtt)
                         vtt_urls[f"{section_name}_vtt"] = vtt_uri
                 # Write & upload timestamps.json alongside mp4
                 local_bounds = _write_bounds_json_local(path_mp4, section_name, start_s, end_s)
